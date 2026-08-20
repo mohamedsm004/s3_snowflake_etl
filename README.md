@@ -1,4 +1,4 @@
-#  Cloud Data Engineering Pipeline: API to Snowflake via AWS S3 & Airflow
+#  Cloud Data Pipeline: API to Snowflake via AWS S3 & Airflow
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://www.python.org/)
 [![Apache Airflow](https://img.shields.io/badge/Apache%20Airflow-2.8.1-017CEE?logo=apacheairflow)](https://airflow.apache.org/)
