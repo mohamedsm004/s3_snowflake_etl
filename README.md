@@ -1,52 +1,34 @@
-# Cloud Data Pipeline: API to Snowflake via AWS S3 & Airflow
-An end-to-end, enterprise-grade Data pipeline orchestrating data extraction from REST APIs, staging raw files on **AWS S3**, ingesting and transforming data through a **Medallion Architecture** in **Snowflake**, fully automated using **Apache Airflow** and secured with **RSA Key-Pair Authentication**.
+# End-to-End Insurance Data Warehouse: AWS S3, Snowflake, Airflow & Tableau
 
-## Tech Stack & Prerequisites
-* **Languages**: Python 3.10+
+An enterprise-grade, end-to-end Data Engineering pipeline orchestrating insurance data ingestion from **AWS S3** into **Snowflake**, transforming raw datasets using a **Medallion Architecture** with **dbt**, automated via **Apache Airflow**, and visualized through an interactive **Tableau** dashboard.
+
+## Tech Stack
 * **Orchestration**: Apache Airflow
 * **Cloud Storage**: AWS S3
 * **Data Warehouse**: Snowflake
+* **Transformation & Testing**: dbt (Data Build Tool)
+* **Business Intelligence**: Tableau Desktop
 * **Containerization**: Docker & Docker Compose
 
 ## Architecture
 ![Architecture du Pipeline](docs/image_pipeline_etl_s3_snowflake.jpg)
 
-## Pipeline Components Breakdown
+## Pipeline Components
 
-### 1. Data Source & Ingestion (`API -> AWS S3`)
-* **Source Systems**: 
-  * *Current (POOC)*: REST API JSON Payload.
-  * *Target (Upcoming)*: Insurance Domain API / Mock Data Generator (Clients, Policies & Claims datasets).
-* **Ingestion Logic**: A custom `PythonOperator` in Airflow queries the source endpoint, converts raw data to CSV in-memory via `pandas`, and streams it directly to an **AWS S3** raw landing zone using `S3Hook`.
-* **Storage Standard**: Immutable partition format: `s3://<bucket_name>/raw/year/month/day/data_<timestamp>.csv`.
+### 1. Ingestion Layer (`AWS S3 -> Snowflake Bronze`)
+* **Source Datasets**: Core Insurance Data (Assurés, Contrats, Sinistres).
+* **Ingestion Logic**: Airflow DAG orchestrates raw CSV file staging on **AWS S3** and loads data into Snowflake using optimized `COPY INTO` commands.
+* **Bronze Layer**: Raw staging zone with schema-on-read capabilities and audit metadata (`ingested_at`).
 
----
+### 2. Transformation Layer (`dbt & Medallion Pattern`)
+* **Silver Layer (`SILVER`)**: Data cleaning, strict typing, deduplication, and standardization across entities using **dbt** models.
+* **Gold Layer (`GOLD`)**: Analytics-ready Data Marts aggregating key business metrics (sinistralité, indemnisation, ratios S/P).
+* **Data Quality**: Enforced via `dbt test` (uniqueness, non-nullability, foreign key integrity).
 
-### 2. Snowflake Data Warehouse Architecture (Medallion Pattern)
+### 3. Analytics & Visualization (`Tableau`)
+* **Data Source**: Live connection to Snowflake Gold layer.
+* **Key Visuals**: KPI Scorecards (Total Sinistres, Ratio S/P), monthly trend analysis, risk breakdown by insurance policy type, and demographic analysis.
 
-The Data Warehouse is structured using the **Medallion Architecture** to guarantee data isolation, quality, and traceability across transformation stages.
-
-#### Bronze Layer (`BRONZE_RAW` Schema)
-* **Purpose**: Raw ingestion zone with schema-on-read capability.
-* **Mechanism**: Executed via `COPY INTO` from the AWS S3 Stage `@S3_STAGE`.
-* **Properties**: Append-only storage including metadata columns like `ingested_at = CURRENT_TIMESTAMP()`.
-
-#### Silver Layer (`SILVER_CLEANED` Schema)
-* **Purpose**: Enterprise data vault containing clean, typed, and deduplicated dimension and fact tables.
-* **Transformation**: Uses SQL `MERGE INTO` statement combined with `ROW_NUMBER()` window functions over `ingested_at` to handle idempotent incremental upserts and deduplication.
-
-#### Gold Layer (`GOLD_ANALYTICS` Schema)
-* **Purpose**: Business-ready analytical aggregation layer (Data Marts).
-* **Implementation**: Materialized Views and SQL Views providing ready-to-consume KPIs for decision-makers and BI tools.
-
----
-
-### 3. Orchestration & Automated Data Quality (Airflow)
-
-The entire flow is managed by an **Apache Airflow** DAG running inside Docker containers:
-
-* **Task Dependencies**:
-  `extract_api_to_s3` ➔ `load_s3_to_bronze` ➔ `transform_bronze_to_silver` ➔ `refresh_gold_layer`
-* **Error Handling & Retries**: Automated retries with configurable delay (`timedelta`) for network resilience against external API or AWS/Snowflake connectivity hiccups.
-
----
+### 4. Orchestration (`Apache Airflow`)
+* **Pipeline Flow**: `upload_s3` ➔ `load_bronze` ➔ `run_dbt_silver` ➔ `run_dbt_gold`
+* **Reliability**: Configured task retries, error handling, and scheduled executions.
