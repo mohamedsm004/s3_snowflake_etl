@@ -1,153 +1,305 @@
-import io
-from datetime import datetime, timedelta
+import os
 import pandas as pd
-import requests
+from datetime import datetime, timedelta
+from faker import Faker
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
 
-BUCKET_NAME = "data-proj-mohamed"
-API_URL = "https://api.sampleapis.com/cartoons/cartoons2D"
+# ==============================================================================
+# CONFIGURATION ET SETUP
+# ==============================================================================
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "data-proj-mohamed")
+S3_CONN_ID = "aws_default"
+SNOWFLAKE_CONN_ID = "snowflake_default"
+
+LOCAL_DATA_DIR = "/tmp/insurance_data"
 
 default_args = {
-    "owner": "mohamed",
+    "owner": "data_engineers",
     "depends_on_past": False,
+    "start_date": datetime(2026, 8, 1),
     "email_on_failure": False,
     "email_on_retry": False,
     "retries": 1,
     "retry_delay": timedelta(minutes=2),
 }
 
-def extract_api_and_upload_to_s3():
-    """Extrait les données de l'API et les dépose sur S3 via S3Hook."""
-    print("1. Extraction des données depuis l'API...")
-    response = requests.get(API_URL)
+# ==============================================================================
+# FONCTIONS PYTHON (EXTRACTION & GENERATION S3)
+# ==============================================================================
+def generate_synthetic_data(**context):
+    """Génère des datasets synthétiques d'assurance."""
+    fake = Faker("fr_FR")
+    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+    
+    # 1. Assurés
+    clients = []
+    for _ in range(200):
+        clients.append({
+            "client_id": fake.uuid4()[:8],
+            "nom": fake.last_name(),
+            "prenom": fake.first_name(),
+            "age": fake.random_int(min=18, max=75),
+            "ville": fake.random_element(["Casablanca", "Rabat", "Tanger", "Marrakech", "Agadir"]),
+            "profession": fake.job(),
+            "score_risque": round(fake.random_number(digits=2) / 10.0, 2),
+            "created_at": fake.date_between(start_date="-3y", end_date="today").strftime("%Y-%m-%d")
+        })
+    df_clients = pd.DataFrame(clients)
+    df_clients.to_csv(f"{LOCAL_DATA_DIR}/assures.csv", index=False)
 
-    if response.status_code != 200:
-        raise Exception(f"Erreur API. Code statut: {response.status_code}")
+    # 2. Contrats
+    contrats = []
+    for i in range(300):
+        client = df_clients.sample(1).iloc[0]
+        contrats.append({
+            "contrat_id": f"CTR-{1000 + i}",
+            "client_id": client["client_id"],
+            "type_couverture": fake.random_element(["Tiers", "Tiers Étendu", "Tous Risques"]),
+            "type_vehicule": fake.random_element(["Berline", "SUV", "Citadine", "Utilitaire"]),
+            "prime_annuelle_mad": fake.random_int(min=3000, max=15000),
+            "date_souscription": fake.date_between(start_date="-2y", end_date="today").strftime("%Y-%m-%d"),
+            "statut_contrat": fake.random_element(["Actif", "Résilié", "Suspendu"])
+        })
+    df_contrats = pd.DataFrame(contrats)
+    df_contrats.to_csv(f"{LOCAL_DATA_DIR}/contrats.csv", index=False)
 
-    data = response.json()
-    df = pd.DataFrame(data)
+    # 3. Sinistres
+    sinistres = []
+    for i in range(150):
+        contrat = df_contrats.sample(1).iloc[0]
+        reclame = fake.random_int(min=2000, max=50000)
+        statut = fake.random_element(["Accepté", "En cours", "Refusé"])
+        rembourse = reclame * fake.random_element([0.8, 1.0]) if statut == "Accepté" else 0.0
+        
+        sinistres.append({
+            "sinistre_id": f"SIN-{5000 + i}",
+            "contrat_id": contrat["contrat_id"],
+            "date_sinistre": fake.date_between(start_date="-1y", end_date="today").strftime("%Y-%m-%d"),
+            "type_sinistre": fake.random_element(["Accident", "Vol", "Incendie", "Bris de glace"]),
+            "montant_reclame_mad": reclame,
+            "montant_rembourse_mad": round(rembourse, 2),
+            "statut_sinistre": statut,
+            "suspicion_fraude": fake.random_element([0, 0, 0, 0, 1])
+        })
+    df_sinistres = pd.DataFrame(sinistres)
+    df_sinistres.to_csv(f"{LOCAL_DATA_DIR}/sinistres.csv", index=False)
 
-    df_clean = df[["id", "title", "year"]].copy()
 
-    csv_buffer = io.StringIO()
-    df_clean.to_csv(csv_buffer, index=False)
+def upload_to_s3(**context):
+    """Envoie les fichiers CSV générés sur AWS S3."""
+    s3_hook = S3Hook(aws_conn_id=S3_CONN_ID)
+    files = ["assures.csv", "contrats.csv", "sinistres.csv"]
+    for file in files:
+        local_path = f"{LOCAL_DATA_DIR}/{file}"
+        s3_key = f"raw/{file}"
+        s3_hook.load_file(
+            filename=local_path,
+            key=s3_key,
+            bucket_name=S3_BUCKET_NAME,
+            replace=True
+        )
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    s3_key = f"raw/cartoons_{timestamp}.csv"
-
-    print(f"2. Téléversement vers S3 : {s3_key}...")
-    s3_hook = S3Hook(aws_conn_id="aws_default")
-    s3_hook.load_string(
-        string_data=csv_buffer.getvalue(),
-        key=s3_key,
-        bucket_name=BUCKET_NAME,
-        replace=True,
-    )
-    print("   -> Succès S3 !")
-
+# ==============================================================================
+# DEFINITION DU DAG AIRFLOW
+# ==============================================================================
 with DAG(
-    dag_id="s3_to_snowflake_pipeline",
+    "s3_snowflake_etl",
     default_args=default_args,
-    description="Pipeline ETL complet : API -> S3 -> Bronze -> Silver -> Gold",
+    description="Pipeline Medallion Architecture (Bronze -> Silver -> Gold Kimball) dans SCHEMA PUBLIC_",
     schedule_interval="@daily",
-    start_date=datetime(2026, 1, 1),
     catchup=False,
-    tags=["data_engineering", "snowflake", "medallion"],
 ) as dag:
 
-    # 1. Extraction et chargement vers AWS S3
-    task_extract_to_s3 = PythonOperator(
-        task_id="extract_api_to_s3",
-        python_callable=extract_api_and_upload_to_s3,
+    # 1. Génération données locales
+    task_generate_data = PythonOperator(
+        task_id="generate_data",
+        python_callable=generate_synthetic_data,
     )
 
-    # 2. Ingestion S3 vers couche BRONZE (Raw)
-    task_load_to_bronze = SnowflakeOperator(
-        task_id="load_s3_to_bronze",
-        snowflake_conn_id="snowflake_default",
+    # 2. Upload S3
+    task_upload_s3 = PythonOperator(
+        task_id="upload_to_s3",
+        python_callable=upload_to_s3,
+    )
+
+    # --------------------------------------------------------------------------
+    # 3. COUCHE BRONZE : DONNEES BRUTES (SCHEMA PUBLIC_)
+    # --------------------------------------------------------------------------
+    task_load_bronze = SnowflakeOperator(
+        task_id="load_bronze",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
         sql="""
-            COPY INTO STAGE_DB.BRONZE.CARTOONS_RAW (id, title, date_year, ingested_at)
-            FROM (
-                SELECT $1, $2, $3, CURRENT_TIMESTAMP()
-                FROM @STAGE_DB.RAW_DATA.S3_STAGE
-            )
-            FILE_FORMAT = (
-                TYPE = 'CSV'
-                FIELD_DELIMITER = ','
-                SKIP_HEADER = 1
-                FIELD_OPTIONALLY_ENCLOSED_BY = '"'
-            )
-            PATTERN = '.*cartoons_.*\\.csv'
+            USE DATABASE DEV_INSURANCE_DB;
+            USE SCHEMA PUBLIC_;
+
+            COPY INTO DEV_INSURANCE_DB.PUBLIC_.BRONZE_ASSURES
+            FROM @S3_INSURANCE_STAGE/raw/assures.csv
+            FILE_FORMAT = (FORMAT_NAME = 'CSV_INSURANCE_FORMAT')
+            ON_ERROR = 'CONTINUE';
+
+            COPY INTO DEV_INSURANCE_DB.PUBLIC_.BRONZE_CONTRATS
+            FROM @S3_INSURANCE_STAGE/raw/contrats.csv
+            FILE_FORMAT = (FORMAT_NAME = 'CSV_INSURANCE_FORMAT')
+            ON_ERROR = 'CONTINUE';
+
+            COPY INTO DEV_INSURANCE_DB.PUBLIC_.BRONZE_SINISTRES
+            FROM @S3_INSURANCE_STAGE/raw/sinistres.csv
+            FILE_FORMAT = (FORMAT_NAME = 'CSV_INSURANCE_FORMAT')
             ON_ERROR = 'CONTINUE';
         """,
     )
 
-    # 3. Transformation BRONZE -> SILVER (Dédoublonnage & Typage)
-    task_transform_to_silver = SnowflakeOperator(
-        task_id="transform_bronze_to_silver",
-        snowflake_conn_id="snowflake_default",
+    # --------------------------------------------------------------------------
+    # 4. COUCHE SILVER : DONNEES NETTOYEES ET RETRAITEES (SCHEMA PUBLIC_)
+    # --------------------------------------------------------------------------
+    task_transform_silver = SnowflakeOperator(
+        task_id="transform_silver",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
         sql="""
-            MERGE INTO SILVER.DIM_CARTOONS AS target
-            USING (
-                WITH ranked_data AS (
-                    SELECT 
-                        TRY_CAST(TRIM(id) AS INT) AS clean_id,
-                        TRIM(title) AS clean_title,
-                        TRY_CAST(TRIM(date_year) AS INT) AS clean_year,
-                        ingested_at,
-                        -- Dédoublonnage : Conserve l'enregistrement le plus récent par ID
-                        ROW_NUMBER() OVER (
-                            PARTITION BY TRY_CAST(TRIM(id) AS INT) 
-                            ORDER BY ingested_at DESC
-                        ) AS row_num
-                    FROM BRONZE.CARTOONS_RAW
-                    WHERE id IS NOT NULL 
-                    AND TRIM(id) != ''
-                    AND TRY_CAST(TRIM(id) AS INT) IS NOT NULL
-                )
-                SELECT 
-                    clean_id,
-                    clean_title,
-                    clean_year,
-                    ingested_at
-                FROM ranked_data
-                WHERE row_num = 1
-            ) AS source
-            ON target.cartoon_id = source.clean_id
+            USE DATABASE DEV_INSURANCE_DB;
+            USE SCHEMA PUBLIC_;
 
-            -- Mise à jour si le titre ou l'année a changé
-            WHEN MATCHED AND (target.title != source.clean_title OR target.release_year != source.clean_year) THEN
-                UPDATE SET 
-                    target.title = source.clean_title,
-                    target.release_year = source.clean_year,
-                    target.updated_at = CURRENT_TIMESTAMP()
+            -- Silver Assurés : Formatage des textes et segmentation âge
+            CREATE OR REPLACE TABLE DEV_INSURANCE_DB.PUBLIC_.SILVER_ASSURES AS
+            SELECT 
+                client_id, 
+                UPPER(TRIM(nom)) AS nom, 
+                INITCAP(TRIM(prenom)) AS prenom, 
+                age,
+                CASE 
+                    WHEN age < 25 THEN '18-24' 
+                    WHEN age BETWEEN 25 AND 40 THEN '25-40' 
+                    WHEN age BETWEEN 41 AND 60 THEN '41-60' 
+                    ELSE '60+' 
+                END AS tranche_age,
+                TRIM(ville) AS ville, 
+                TRIM(profession) AS profession, 
+                score_risque, 
+                CAST(created_at AS DATE) AS date_inscription
+            FROM DEV_INSURANCE_DB.PUBLIC_.BRONZE_ASSURES;
 
-            -- Insertion si l'ID n'existe pas encore dans la couche Silver
-            WHEN NOT MATCHED THEN
-                INSERT (cartoon_id, title, release_year, created_at)
-                VALUES (source.clean_id, source.clean_title, source.clean_year, source.ingested_at);
+            -- Silver Contrats : Typage propre et validation
+            CREATE OR REPLACE TABLE DEV_INSURANCE_DB.PUBLIC_.SILVER_CONTRATS AS
+            SELECT 
+                contrat_id, 
+                client_id, 
+                TRIM(type_couverture) AS type_couverture, 
+                TRIM(type_vehicule) AS type_vehicule, 
+                CAST(prime_annuelle_mad AS DECIMAL(10, 2)) AS prime_annuelle_mad, 
+                CAST(date_souscription AS DATE) AS date_souscription, 
+                TRIM(statut_contrat) AS statut_contrat
+            FROM DEV_INSURANCE_DB.PUBLIC_.BRONZE_CONTRATS;
+
+            -- Silver Sinistres : Calcul du reste à charge et flags métiers
+            CREATE OR REPLACE TABLE DEV_INSURANCE_DB.PUBLIC_.SILVER_SINISTRES AS
+            SELECT 
+                sinistre_id,
+                contrat_id,
+                CAST(date_sinistre AS DATE) AS date_sinistre,
+                TRIM(type_sinistre) AS type_sinistre,
+                CAST(montant_reclame_mad AS DECIMAL(10, 2)) AS montant_reclame_mad,
+                CAST(montant_rembourse_mad AS DECIMAL(10, 2)) AS montant_rembourse_mad,
+                ROUND(montant_reclame_mad - montant_rembourse_mad, 2) AS montant_reste_a_charge_mad,
+                TRIM(statut_sinistre) AS statut_sinistre,
+                CAST(suspicion_fraude AS INT) AS suspicion_fraude,
+                CASE WHEN statut_sinistre = 'Accepté' THEN 1 ELSE 0 END AS est_accepte,
+                CASE WHEN statut_sinistre = 'Refusé' THEN 1 ELSE 0 END AS est_refuse
+            FROM DEV_INSURANCE_DB.PUBLIC_.BRONZE_SINISTRES;
         """,
     )
 
-    # 4. Rafraîchissement de la vue GOLD (Analytics)
-    task_refresh_gold = SnowflakeOperator(
-        task_id="refresh_gold_layer",
-        snowflake_conn_id="snowflake_default",
+    # --------------------------------------------------------------------------
+    # 5. COUCHE GOLD : MODELISATION DIMENSIONNELLE (DIM, FACT & VIEWS KIMBALL)
+    # --------------------------------------------------------------------------
+    task_load_gold = SnowflakeOperator(
+        task_id="load_gold",
+        snowflake_conn_id=SNOWFLAKE_CONN_ID,
         sql="""
-            CREATE OR REPLACE VIEW STAGE_DB.GOLD.VW_CARTOONS_SUMMARY AS
+            USE DATABASE DEV_INSURANCE_DB;
+            USE SCHEMA PUBLIC_;
+
+            -- A. DIMENSION TEMPS
+            CREATE OR REPLACE TABLE DEV_INSURANCE_DB.PUBLIC_.DIM_TEMPS AS
+            WITH date_range AS (
+                SELECT DATEADD(day, SEQ4(), '2023-01-01'::DATE) AS date_day
+                FROM TABLE(GENERATOR(ROWCOUNT => 1825))
+            )
+            SELECT
+                date_day,
+                YEAR(date_day) AS annee,
+                QUARTER(date_day) AS trimestre,
+                MONTH(date_day) AS mois,
+                MONTHNAME(date_day) AS nom_mois,
+                DAY(date_day) AS jour_mois,
+                DAYOFWEEK(date_day) AS jour_semaine,
+                WEEKOFYEAR(date_day) AS semaine_annee,
+                CASE WHEN DAYOFWEEK(date_day) IN (0, 6) THEN TRUE ELSE FALSE END AS est_weekend
+            FROM date_range;
+
+            -- B. DIMENSION CLIENTS
+            CREATE OR REPLACE TABLE DEV_INSURANCE_DB.PUBLIC_.DIM_CLIENTS AS
             SELECT 
-                release_year,
-                COUNT(cartoon_id) AS total_cartoons,
-                MIN(created_at) AS first_ingested_at,
-                MAX(updated_at) AS last_updated_at
-            FROM STAGE_DB.SILVER.DIM_CARTOONS
-            WHERE release_year IS NOT NULL
-            GROUP BY release_year;
-                    """,
+                client_id, 
+                nom, 
+                prenom, 
+                age,
+                tranche_age,
+                ville, 
+                profession, 
+                score_risque, 
+                date_inscription
+            FROM DEV_INSURANCE_DB.PUBLIC_.SILVER_ASSURES;
+
+            -- C. DIMENSION CONTRATS
+            CREATE OR REPLACE TABLE DEV_INSURANCE_DB.PUBLIC_.DIM_CONTRATS AS
+            SELECT 
+                contrat_id, 
+                client_id, 
+                type_couverture, 
+                type_vehicule, 
+                prime_annuelle_mad, 
+                date_souscription, 
+                statut_contrat
+            FROM DEV_INSURANCE_DB.PUBLIC_.SILVER_CONTRATS;
+
+            -- D. DIMENSION TYPE DE SINISTRE
+            CREATE OR REPLACE TABLE DEV_INSURANCE_DB.PUBLIC_.DIM_TYPE_SINISTRE AS
+            SELECT DISTINCT 
+                DENSE_RANK() OVER (ORDER BY type_sinistre) AS type_sinistre_id,
+                type_sinistre AS libelle_sinistre,
+                CASE 
+                    WHEN type_sinistre IN ('Accident', 'Incendie') THEN 'Élevée' 
+                    WHEN type_sinistre IN ('Vol') THEN 'Moyenne' 
+                    ELSE 'Faible' 
+                END AS categorie_gravite
+            FROM DEV_INSURANCE_DB.PUBLIC_.SILVER_SINISTRES;
+
+            -- E. TABLE DE FAITS SINISTRES (Stricte Kimball : FKs + Métriques Numériques Additives)
+            CREATE OR REPLACE TABLE DEV_INSURANCE_DB.PUBLIC_.FACT_SINISTRES AS
+            SELECT 
+                s.sinistre_id,
+                s.date_sinistre,
+                c.client_id,
+                s.contrat_id,
+                t.type_sinistre_id,
+                s.montant_reclame_mad,
+                s.montant_rembourse_mad,
+                s.montant_reste_a_charge_mad,
+                s.suspicion_fraude,
+                s.est_accepte,
+                s.est_refuse
+            FROM DEV_INSURANCE_DB.PUBLIC_.SILVER_SINISTRES s
+            JOIN DEV_INSURANCE_DB.PUBLIC_.SILVER_CONTRATS c ON s.contrat_id = c.contrat_id
+            JOIN DEV_INSURANCE_DB.PUBLIC_.DIM_TYPE_SINISTRE t ON s.type_sinistre = t.libelle_sinistre;
+
+        """,
     )
 
-    # Définition des dépendances
-    task_extract_to_s3 >> task_load_to_bronze >> task_transform_to_silver >> task_refresh_gold
+    # ==========================================================================
+    # FLUX D'EXECUTION DU PIPELINE (DEPENDANCES)
+    # ==========================================================================
+    task_generate_data >> task_upload_s3 >> task_load_bronze >> task_transform_silver >> task_load_gold
